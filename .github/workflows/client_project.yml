@@ -1,0 +1,177 @@
+java-docker-defaults: &java-docker-defaults
+  docker:
+    - image: mafs/java-builder:11-jdk
+      auth:
+        username: $DOCKERHUB_USER
+        password: $DOCKERHUB_PASSWORD
+
+curl-docker-defaults: &curl-docker-defaults
+  docker:
+    - image: mafs/curl:latest
+      auth:
+        username: $DOCKERHUB_USER
+        password: $DOCKERHUB_PASSWORD
+
+maven-env-defaults: &maven-env-defaults
+  <<: *java-docker-defaults
+  working_directory: ~/repo
+  environment:
+    MAVEN_OPTS: -Xmx3200m -Dmaven.wagon.http.retryHandler.count=3
+    TZ: "America/New_York"  
+
+curl-env-defaults: &curl-env-defaults
+  <<: *curl-docker-defaults
+  working_directory: ~/repo
+
+version: 2
+jobs:
+  build:
+    <<: *maven-env-defaults
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "pom.xml" }}
+      - run: mvn dependency:go-offline -DoverWriteSnapshots=true
+      - save_cache:
+          paths:
+            - ~/.m2
+          key: v1-dependencies-{{ checksum "pom.xml" }}
+      - run: mvn compile -Dmaven.test.skip=true
+  code-analysis:
+    <<: *maven-env-defaults
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "pom.xml" }}            
+      - run: mvn dependency:resolve-plugins dependency:go-offline -DoverWriteSnapshots=true
+      - save_cache:
+          paths:
+            - ~/.m2
+          key: v1-dependencies-{{ checksum "pom.xml" }}
+      - run: mvn -U compile spotbugs:check -Dmaven.test.skip=true      
+  test:
+    parallelism: 4
+    <<: *maven-env-defaults
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "pom.xml" }}
+      - run: mvn dependency:resolve-plugins dependency:go-offline -DoverWriteSnapshots=true
+      - save_cache:
+          paths:
+            - ~/.m2
+          key: v1-dependencies-{{ checksum "pom.xml" }}
+      - run: |
+          mvn \
+          -Dtest=$(for file in $(circleci tests glob "src/test/*/*.java" \
+          | circleci tests split --split-by=timings); \
+          do basename $file \
+          | sed -e "s/.java/,/"; \
+          done | tr -d '\r\n') \
+          -e test
+      - store_test_results:
+          path: target/surefire-reports
+  publish:
+    <<: *maven-env-defaults
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "pom.xml" }}            
+      - run: mvn dependency:resolve-plugins dependency:go-offline -DoverWriteSnapshots=true
+      - save_cache:
+          paths:
+            - ~/.m2
+          key: v1-dependencies-{{ checksum "pom.xml" }}
+      - run: mvn deploy -Dmaven.test.skip=true                                          
+  deploy-dev:
+    <<: *curl-env-defaults
+    steps:
+    - checkout
+    - run: chmod +x ./scripts/webhook
+    - run: ./scripts/webhook \{\"build\":\"$CIRCLE_BUILD_NUM\",\"branch\":\"$CIRCLE_BRANCH\",\"sha1\":\"$CIRCLE_SHA1\",\"env\":\"dev\"\}
+        https://webhook.mikealbert.com:9000/accounting-processor-stage      
+  deploy-qa:
+    <<: *curl-env-defaults
+    steps:
+    - checkout
+    - run: chmod +x ./scripts/webhook
+    - run: ./scripts/webhook \{\"build\":\"$CIRCLE_BUILD_NUM\",\"branch\":\"$CIRCLE_BRANCH\",\"sha1\":\"$CIRCLE_SHA1\",\"env\":\"qa\"\}
+        https://webhook.mikealbert.com:9000/accounting-processor-stage
+  deploy-stage:
+    <<: *curl-env-defaults
+    steps:
+    - checkout
+    - run: chmod +x ./scripts/webhook
+    - run: ./scripts/webhook \{\"build\":\"$CIRCLE_BUILD_NUM\",\"branch\":\"$CIRCLE_BRANCH\",\"sha1\":\"$CIRCLE_SHA1\",\"env\":\"stage\"\}
+        https://webhook.mikealbert.com:9000/accounting-processor-stage
+  deploy-prod:
+    <<: *curl-env-defaults
+    steps:
+    - checkout
+    - run: chmod +x ./scripts/webhook
+    - run: ./scripts/webhook \{\"build\":\"$CIRCLE_BUILD_NUM\",\"branch\":\"$CIRCLE_BRANCH\",\"sha1\":\"$CIRCLE_SHA1\",\"env\":\"prod\"\}
+        https://webhook.mikealbert.com:9000/accounting-processor-prod
+  tag-release:
+    <<: *maven-env-defaults
+    steps:
+    - checkout
+    - run: git config user.email "mafs-githubadmin@mikealbert.com"
+    - run: git config user.name "mafs-githubadmin"
+    - run: mvn -B gitflow:release-start -DpushRemote=true -DskipTestProject=true
+    - run: sleep 60    
+    - run: mvn -B gitflow:release-finish -DskipTestProject=true
+workflows:
+  version: 2
+  build_and_deploy:
+    jobs:
+    - build:
+        context: org-global
+    - code-analysis:
+        context: org-global        
+    - test:
+        context: org-global
+    - publish:
+        context: org-global    
+        requires:
+        - build
+        - code-analysis
+        - test        
+    - deploy-dev:
+        context: org-global
+        requires:
+        - publish
+        filters:
+          branches:
+            only: master
+    - hold-deploy-qa:
+        type: approval
+        requires:
+        - deploy-dev           
+    - deploy-qa:
+        context: org-global
+        requires:
+        - hold-deploy-qa        
+    - hold-deploy-stage:
+        type: approval
+        requires:
+        - deploy-qa
+    - deploy-stage:
+        context: org-global      
+        requires:
+        - hold-deploy-stage
+    - hold-deploy-prod:
+        type: approval
+        requires:
+        - deploy-stage
+    - deploy-prod:
+        context: org-global      
+        requires:
+        - hold-deploy-prod
+    - tag-release:
+        context: org-global      
+        requires:
+        - deploy-prod
